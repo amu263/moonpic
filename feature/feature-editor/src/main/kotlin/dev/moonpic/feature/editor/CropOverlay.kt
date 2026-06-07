@@ -22,52 +22,51 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * The 8 directional resize handles + Move + None.
+ * 8 directional resize handles + Move + None.
  *
  * The hit-testing is built so the corner boxes and the edge strips together
- * cover a "L"-shaped region around the entire rect, so the user can grab any
- * side from inside OR outside the rect. The interior of the rect (after the
- * edge strips) is reserved for Move. Outside the corner/edge regions is
- * None — so stray touches on the dimmed area don't grab the rect.
+ * cover an "L"-shaped region around the entire rect. Corners are 200x200
+ * squares straddling the corner pixel (so the user can grab the corner
+ * from *inside* the rect as well as from outside), edges are 120px-wide
+ * strips straddling the edge but clamped to not overlap the corner
+ * boxes, and the deep interior is reserved for Move. Outside everything
+ * is None so stray touches on the dimmed area don't grab anything.
  */
 private enum class Handle { TL, T, TR, R, BR, B, BL, L, Move, None }
 
 private val MoonViolet = Color(0xFF7C4DFF)
 
 /**
- * 12 canvas-px ≈ 4dp on a 3x device, big enough to see but small enough not
- * to cover the image. The hit-testing below uses a much larger region.
+ * Visible handle radius (px). On a 3x device this is ~6dp — small enough
+ * not to cover the image, large enough to see clearly.
  */
-private const val HANDLE_RADIUS_PX = 12f
+private const val HANDLE_RADIUS_PX = 18f
+private const val HANDLE_DOT_PX = 9f
 
 /**
- * Half-size of a corner hit box. 60f means a 120×120 box centred on the
- * corner pixel — finger-friendly (≈40dp on 3x) and straddling the rect edge
- * so touches from either side of the corner pick the corner handle.
+ * Half-size of a corner hit box. 100f → 200x200 box centred on the corner
+ * pixel. On a 3x device this is ~66dp — well above the recommended 48dp
+ * touch target size.
  */
-private const val CORNER_HIT_HALF = 60f
+private const val CORNER_HIT_HALF = 100f
 
 /**
- * Half-width of an edge hit strip. 30f means a 60px-wide strip straddling
- * the rect edge (≈20dp on 3x). Edge strips are clamped to NOT overlap
- * with the corner hit boxes.
+ * Half-width of an edge hit strip. 60f → 120px strip straddling the edge
+ * (~40dp on 3x). Excludes the corner zones.
  */
-private const val EDGE_HIT_HALF = 30f
+private const val EDGE_HIT_HALF = 60f
 
-/**
- * Minimum crop size in image-pixels. Anything smaller becomes a 1×1 crop
- * when we round to int at mapCanvasToImage, which is useless.
- */
+/** Minimum crop size in image-pixels, prevents collapse. */
 private const val MIN_CROP_IMG_PX = 16f
 
 /**
- * Draws a dimmed-out overlay with a draggable, resizable crop rectangle in
- * image-space coordinates (0,0)-(imageWidth,imageHeight) scaled to the canvas.
+ * Crop overlay.
  *
- * The "dim outside / show inside" effect is implemented as four filled
- * rectangles around the crop rect. We avoid BlendMode.Clear because Clear
- * behaves unreliably with Compose Canvas compositing — the four-strip
- * approach is foolproof.
+ * Critical design point: during a drag, we update the **local** `rect`
+ * only. The parent state is updated *only* in `onDragEnd` (via
+ * `onCropChange`). Updating the parent on every drag event would force
+ * recomposition and reset `rect` via the `remember(crop, fit)` block,
+ * which is what caused the visible stuttering in v0.1.2.
  */
 @Composable
 fun CropOverlay(
@@ -85,8 +84,10 @@ fun CropOverlay(
     var rect by remember(crop, fit) {
         mutableStateOf<Rect>(
             crop?.let { mapImageToCanvas(it, fit) }
-                ?: Rect(0f, 0f, imageSize.width.toFloat(), imageSize.height.toFloat())
-                    .let { mapImageToCanvas(CropRect(0, 0, imageSize.width, imageSize.height), fit) },
+                ?: mapImageToCanvas(
+                    CropRect(0, 0, imageSize.width, imageSize.height),
+                    fit,
+                ),
         )
     }
     var active by remember { mutableStateOf(Handle.None) }
@@ -95,13 +96,20 @@ fun CropOverlay(
     Canvas(
         modifier = modifier
             .fillMaxSize()
-            .pointerInput(fit) {
+            .pointerInput(fit, imageBounds) {
                 detectDragGestures(
                     onDragStart = { off ->
                         active = pickHandle(off, rect)
                         lastPos = off
                     },
-                    onDragEnd = { active = Handle.None },
+                    onDragEnd = {
+                        // Sync local → parent only at drag end so we don't
+                        // thrash recomposition during the drag.
+                        if (active != Handle.None) {
+                            onCropChange(mapCanvasToImage(rect, fit))
+                        }
+                        active = Handle.None
+                    },
                     onDragCancel = { active = Handle.None },
                 ) { change, _ ->
                     if (active == Handle.None) return@detectDragGestures
@@ -109,7 +117,7 @@ fun CropOverlay(
                     val dy = change.position.y - lastPos.y
                     lastPos = change.position
                     rect = applyDrag(rect, active, dx, dy, fit, imageBounds)
-                    onCropChange(mapCanvasToImage(rect, fit))
+                    // NOTE: no onCropChange here — that's the whole point.
                 }
             },
     ) {
@@ -176,8 +184,8 @@ fun CropOverlay(
             style = Stroke(width = 3f),
         )
 
-        // Corner handles. The active corner is drawn larger and fully
-        // opaque as visual feedback that the touch was registered.
+        // Corner handles. The active corner is drawn larger as visual
+        // feedback that the touch was registered.
         for (h in listOf(Handle.TL, Handle.TR, Handle.BL, Handle.BR)) {
             val center = when (h) {
                 Handle.TL -> rect.topLeft
@@ -186,48 +194,34 @@ fun CropOverlay(
                 Handle.BR -> rect.bottomRight
                 else -> Offset.Zero
             }
-            val r = if (active == h) HANDLE_RADIUS_PX + 4f else HANDLE_RADIUS_PX
-            val dotR = if (active == h) HANDLE_RADIUS_PX - 3f else HANDLE_RADIUS_PX - 5f
+            val isActive = active == h
             drawCircle(
-                Color.White.copy(alpha = if (active == h) 0.95f else 0.85f),
-                radius = r,
+                Color.White.copy(alpha = if (isActive) 1f else 0.85f),
+                radius = if (isActive) HANDLE_RADIUS_PX + 4f else HANDLE_RADIUS_PX,
                 center = center,
             )
             drawCircle(
-                MoonViolet.copy(alpha = if (active == h) 1f else 0.9f),
-                radius = dotR,
+                MoonViolet.copy(alpha = if (isActive) 1f else 0.9f),
+                radius = if (isActive) HANDLE_DOT_PX + 2f else HANDLE_DOT_PX,
                 center = center,
             )
         }
 
-        // Mid-edge pips — small visual hint that the edges are also
-        // draggable. Non-interactive (the actual hit area is a 60px strip
-        // around each edge).
-        val edgePipColor = if (active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)) {
-            MoonViolet
-        } else {
-            Color.White.copy(alpha = 0.85f)
+        // Mid-edge pips. Active edge is drawn larger/violet as feedback.
+        val anyEdgeActive = active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)
+        for ((edge, center) in listOf(
+            Handle.T to Offset((rect.left + rect.right) / 2f, rect.top),
+            Handle.B to Offset((rect.left + rect.right) / 2f, rect.bottom),
+            Handle.L to Offset(rect.left, (rect.top + rect.bottom) / 2f),
+            Handle.R to Offset(rect.right, (rect.top + rect.bottom) / 2f),
+        )) {
+            val isActive = active == edge
+            drawCircle(
+                if (isActive) MoonViolet else Color.White.copy(alpha = 0.85f),
+                radius = if (isActive || anyEdgeActive) 11f else 7f,
+                center = center,
+            )
         }
-        drawCircle(
-            edgePipColor,
-            radius = if (active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)) 9f else 6f,
-            center = Offset((rect.left + rect.right) / 2f, rect.top),
-        )
-        drawCircle(
-            edgePipColor,
-            radius = if (active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)) 9f else 6f,
-            center = Offset((rect.left + rect.right) / 2f, rect.bottom),
-        )
-        drawCircle(
-            edgePipColor,
-            radius = if (active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)) 9f else 6f,
-            center = Offset(rect.left, (rect.top + rect.bottom) / 2f),
-        )
-        drawCircle(
-            edgePipColor,
-            radius = if (active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)) 9f else 6f,
-            center = Offset(rect.right, (rect.top + rect.bottom) / 2f),
-        )
     }
 }
 
@@ -268,13 +262,13 @@ private fun imageBoundsOnCanvas(f: Fit, image: IntSize): Rect {
 /**
  * Hit-testing for the 8 directional handles + Move.
  *
- * Corners are 120×120 boxes straddling the corner pixel. Edge strips are
- * 60px wide, also straddling the edge, but clamped to NOT overlap the
- * corner boxes. The rect interior (after subtracting the edge strips) is
- * Move. Anything else is None.
+ * Corners are 200×200 boxes straddling the corner pixel. Edge strips are
+ * 120px wide, also straddling the edge, but clamped to NOT overlap the
+ * corner boxes. The deep interior of the rect (after subtracting the
+ * edge strips) is Move. Outside everything is None.
  */
 private fun pickHandle(off: Offset, rect: Rect): Handle {
-    // Corner hit zones (square, centred on the corner pixel).
+    // Corners (square, centred on the corner pixel).
     if (off.x in (rect.left - CORNER_HIT_HALF)..(rect.left + CORNER_HIT_HALF) &&
         off.y in (rect.top - CORNER_HIT_HALF)..(rect.top + CORNER_HIT_HALF)
     ) return Handle.TL
@@ -288,7 +282,7 @@ private fun pickHandle(off: Offset, rect: Rect): Handle {
         off.y in (rect.bottom - CORNER_HIT_HALF)..(rect.bottom + CORNER_HIT_HALF)
     ) return Handle.BR
 
-    // Edge hit strips (not overlapping the corner boxes).
+    // Edges (not overlapping the corner boxes).
     if (off.y in (rect.top - EDGE_HIT_HALF)..(rect.top + EDGE_HIT_HALF) &&
         off.x in (rect.left + CORNER_HIT_HALF)..(rect.right - CORNER_HIT_HALF)
     ) return Handle.T
@@ -302,7 +296,7 @@ private fun pickHandle(off: Offset, rect: Rect): Handle {
         off.y in (rect.top + CORNER_HIT_HALF)..(rect.bottom - CORNER_HIT_HALF)
     ) return Handle.R
 
-    // Interior of the rect is Move.
+    // Interior is Move.
     if (rect.contains(off)) return Handle.Move
 
     return Handle.None
