@@ -21,7 +21,44 @@ import dev.moonpic.feature.editor.transforms.CropRect
 import kotlin.math.max
 import kotlin.math.min
 
-private enum class Handle { TL, TR, BL, BR, Move, None }
+/**
+ * The 8 directional resize handles + Move + None.
+ *
+ * The hit-testing is built so the corner boxes and the edge strips together
+ * cover a "L"-shaped region around the entire rect, so the user can grab any
+ * side from inside OR outside the rect. The interior of the rect (after the
+ * edge strips) is reserved for Move. Outside the corner/edge regions is
+ * None — so stray touches on the dimmed area don't grab the rect.
+ */
+private enum class Handle { TL, T, TR, R, BR, B, BL, L, Move, None }
+
+private val MoonViolet = Color(0xFF7C4DFF)
+
+/**
+ * 12 canvas-px ≈ 4dp on a 3x device, big enough to see but small enough not
+ * to cover the image. The hit-testing below uses a much larger region.
+ */
+private const val HANDLE_RADIUS_PX = 12f
+
+/**
+ * Half-size of a corner hit box. 60f means a 120×120 box centred on the
+ * corner pixel — finger-friendly (≈40dp on 3x) and straddling the rect edge
+ * so touches from either side of the corner pick the corner handle.
+ */
+private const val CORNER_HIT_HALF = 60f
+
+/**
+ * Half-width of an edge hit strip. 30f means a 60px-wide strip straddling
+ * the rect edge (≈20dp on 3x). Edge strips are clamped to NOT overlap
+ * with the corner hit boxes.
+ */
+private const val EDGE_HIT_HALF = 30f
+
+/**
+ * Minimum crop size in image-pixels. Anything smaller becomes a 1×1 crop
+ * when we round to int at mapCanvasToImage, which is useless.
+ */
+private const val MIN_CROP_IMG_PX = 16f
 
 /**
  * Draws a dimmed-out overlay with a draggable, resizable crop rectangle in
@@ -30,7 +67,7 @@ private enum class Handle { TL, TR, BL, BR, Move, None }
  * The "dim outside / show inside" effect is implemented as four filled
  * rectangles around the crop rect. We avoid BlendMode.Clear because Clear
  * behaves unreliably with Compose Canvas compositing — the four-strip
- * approach is foolproof and lets us tune the dim alpha freely.
+ * approach is foolproof.
  */
 @Composable
 fun CropOverlay(
@@ -43,14 +80,13 @@ fun CropOverlay(
     if (imageSize.width <= 0 || imageSize.height <= 0) return
 
     val fit = remember(imageSize, canvasSize) { fitRect(imageSize, canvasSize) }
+    val imageBounds = remember(fit, imageSize) { imageBoundsOnCanvas(fit, imageSize) }
 
     var rect by remember(crop, fit) {
         mutableStateOf<Rect>(
             crop?.let { mapImageToCanvas(it, fit) }
-                ?: mapImageToCanvas(
-                    CropRect(0, 0, imageSize.width, imageSize.height),
-                    fit,
-                ),
+                ?: Rect(0f, 0f, imageSize.width.toFloat(), imageSize.height.toFloat())
+                    .let { mapImageToCanvas(CropRect(0, 0, imageSize.width, imageSize.height), fit) },
         )
     }
     var active by remember { mutableStateOf(Handle.None) }
@@ -68,19 +104,20 @@ fun CropOverlay(
                     onDragEnd = { active = Handle.None },
                     onDragCancel = { active = Handle.None },
                 ) { change, _ ->
+                    if (active == Handle.None) return@detectDragGestures
                     val dx = change.position.x - lastPos.x
                     val dy = change.position.y - lastPos.y
                     lastPos = change.position
-                    if (active != Handle.None) {
-                        rect = applyDrag(rect, active, dx, dy, fit)
-                        onCropChange(mapCanvasToImage(rect, fit))
-                    }
+                    rect = applyDrag(rect, active, dx, dy, fit, imageBounds)
+                    onCropChange(mapCanvasToImage(rect, fit))
                 }
             },
     ) {
         val dim = Color.Black.copy(alpha = 0.55f)
 
-        // Top strip
+        // Four strips: top / bottom / left / right. Together they cover
+        // exactly the area outside the crop rect, so the inside stays
+        // fully visible.
         if (rect.top > 0f) {
             drawRect(
                 color = dim,
@@ -88,7 +125,6 @@ fun CropOverlay(
                 size = Size(size.width, rect.top),
             )
         }
-        // Bottom strip
         if (rect.bottom < size.height) {
             drawRect(
                 color = dim,
@@ -96,7 +132,6 @@ fun CropOverlay(
                 size = Size(size.width, size.height - rect.bottom),
             )
         }
-        // Left strip (clamped to crop-rect vertical range so corners don't double-draw)
         if (rect.left > 0f) {
             drawRect(
                 color = dim,
@@ -104,7 +139,6 @@ fun CropOverlay(
                 size = Size(rect.left, rect.height),
             )
         }
-        // Right strip
         if (rect.right < size.width) {
             drawRect(
                 color = dim,
@@ -113,7 +147,8 @@ fun CropOverlay(
             )
         }
 
-        // Rule-of-thirds grid — clipped so the lines never spill into the dimmed area
+        // Rule-of-thirds grid — clipped to the crop rect so the lines
+        // never spill into the dimmed area.
         clipRect(left = rect.left, top = rect.top, right = rect.right, bottom = rect.bottom) {
             val third = rect.width / 3f
             val thirdH = rect.height / 3f
@@ -133,7 +168,7 @@ fun CropOverlay(
             }
         }
 
-        // Bright border around the crop rect
+        // Bright border around the crop rect.
         drawRect(
             color = Color.White,
             topLeft = rect.topLeft,
@@ -141,15 +176,60 @@ fun CropOverlay(
             style = Stroke(width = 3f),
         )
 
-        // Corner handles — generous radius (12 + 7) so they're easy to see
-        for (h in listOf(rect.topLeft, rect.topRight, rect.bottomLeft, rect.bottomRight)) {
-            drawCircle(Color.White, radius = 12f, center = h)
-            drawCircle(MoonVioletThumb, radius = 7f, center = h)
+        // Corner handles. The active corner is drawn larger and fully
+        // opaque as visual feedback that the touch was registered.
+        for (h in listOf(Handle.TL, Handle.TR, Handle.BL, Handle.BR)) {
+            val center = when (h) {
+                Handle.TL -> rect.topLeft
+                Handle.TR -> rect.topRight
+                Handle.BL -> rect.bottomLeft
+                Handle.BR -> rect.bottomRight
+                else -> Offset.Zero
+            }
+            val r = if (active == h) HANDLE_RADIUS_PX + 4f else HANDLE_RADIUS_PX
+            val dotR = if (active == h) HANDLE_RADIUS_PX - 3f else HANDLE_RADIUS_PX - 5f
+            drawCircle(
+                Color.White.copy(alpha = if (active == h) 0.95f else 0.85f),
+                radius = r,
+                center = center,
+            )
+            drawCircle(
+                MoonViolet.copy(alpha = if (active == h) 1f else 0.9f),
+                radius = dotR,
+                center = center,
+            )
         }
+
+        // Mid-edge pips — small visual hint that the edges are also
+        // draggable. Non-interactive (the actual hit area is a 60px strip
+        // around each edge).
+        val edgePipColor = if (active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)) {
+            MoonViolet
+        } else {
+            Color.White.copy(alpha = 0.85f)
+        }
+        drawCircle(
+            edgePipColor,
+            radius = if (active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)) 9f else 6f,
+            center = Offset((rect.left + rect.right) / 2f, rect.top),
+        )
+        drawCircle(
+            edgePipColor,
+            radius = if (active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)) 9f else 6f,
+            center = Offset((rect.left + rect.right) / 2f, rect.bottom),
+        )
+        drawCircle(
+            edgePipColor,
+            radius = if (active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)) 9f else 6f,
+            center = Offset(rect.left, (rect.top + rect.bottom) / 2f),
+        )
+        drawCircle(
+            edgePipColor,
+            radius = if (active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)) 9f else 6f,
+            center = Offset(rect.right, (rect.top + rect.bottom) / 2f),
+        )
     }
 }
-
-private val MoonVioletThumb = Color(0xFF7C4DFF)
 
 private data class Fit(val scale: Float, val dx: Float, val dy: Float)
 
@@ -186,55 +266,109 @@ private fun imageBoundsOnCanvas(f: Fit, image: IntSize): Rect {
 }
 
 /**
- * Hit-testing:
- *  - corners get a generous 80px radius (finger-friendly)
- *  - inside the rect → Move
- *  - anywhere else → None (gesture is ignored, so stray touches in the
- *    dimmed area don't cause the rect to jump).
+ * Hit-testing for the 8 directional handles + Move.
+ *
+ * Corners are 120×120 boxes straddling the corner pixel. Edge strips are
+ * 60px wide, also straddling the edge, but clamped to NOT overlap the
+ * corner boxes. The rect interior (after subtracting the edge strips) is
+ * Move. Anything else is None.
  */
 private fun pickHandle(off: Offset, rect: Rect): Handle {
-    val t = 80f
-    return when {
-        (off - rect.topLeft).getDistance() < t -> Handle.TL
-        (off - rect.topRight).getDistance() < t -> Handle.TR
-        (off - rect.bottomLeft).getDistance() < t -> Handle.BL
-        (off - rect.bottomRight).getDistance() < t -> Handle.BR
-        rect.contains(off) -> Handle.Move
-        else -> Handle.None
-    }
+    // Corner hit zones (square, centred on the corner pixel).
+    if (off.x in (rect.left - CORNER_HIT_HALF)..(rect.left + CORNER_HIT_HALF) &&
+        off.y in (rect.top - CORNER_HIT_HALF)..(rect.top + CORNER_HIT_HALF)
+    ) return Handle.TL
+    if (off.x in (rect.right - CORNER_HIT_HALF)..(rect.right + CORNER_HIT_HALF) &&
+        off.y in (rect.top - CORNER_HIT_HALF)..(rect.top + CORNER_HIT_HALF)
+    ) return Handle.TR
+    if (off.x in (rect.left - CORNER_HIT_HALF)..(rect.left + CORNER_HIT_HALF) &&
+        off.y in (rect.bottom - CORNER_HIT_HALF)..(rect.bottom + CORNER_HIT_HALF)
+    ) return Handle.BL
+    if (off.x in (rect.right - CORNER_HIT_HALF)..(rect.right + CORNER_HIT_HALF) &&
+        off.y in (rect.bottom - CORNER_HIT_HALF)..(rect.bottom + CORNER_HIT_HALF)
+    ) return Handle.BR
+
+    // Edge hit strips (not overlapping the corner boxes).
+    if (off.y in (rect.top - EDGE_HIT_HALF)..(rect.top + EDGE_HIT_HALF) &&
+        off.x in (rect.left + CORNER_HIT_HALF)..(rect.right - CORNER_HIT_HALF)
+    ) return Handle.T
+    if (off.y in (rect.bottom - EDGE_HIT_HALF)..(rect.bottom + EDGE_HIT_HALF) &&
+        off.x in (rect.left + CORNER_HIT_HALF)..(rect.right - CORNER_HIT_HALF)
+    ) return Handle.B
+    if (off.x in (rect.left - EDGE_HIT_HALF)..(rect.left + EDGE_HIT_HALF) &&
+        off.y in (rect.top + CORNER_HIT_HALF)..(rect.bottom - CORNER_HIT_HALF)
+    ) return Handle.L
+    if (off.x in (rect.right - EDGE_HIT_HALF)..(rect.right + EDGE_HIT_HALF) &&
+        off.y in (rect.top + CORNER_HIT_HALF)..(rect.bottom - CORNER_HIT_HALF)
+    ) return Handle.R
+
+    // Interior of the rect is Move.
+    if (rect.contains(off)) return Handle.Move
+
+    return Handle.None
 }
 
-private fun applyDrag(rect: Rect, h: Handle, dx: Float, dy: Float, fit: Fit): Rect {
-    val minSize = 16f * fit.scale // 16 image-pixels minimum
+private fun applyDrag(
+    rect: Rect,
+    h: Handle,
+    dx: Float,
+    dy: Float,
+    fit: Fit,
+    imageBounds: Rect,
+): Rect {
+    val minSize = MIN_CROP_IMG_PX * fit.scale
     return when (h) {
         Handle.None -> rect
+
+        // Whole-rect translation, clamped so the rect stays inside the
+        // image bounds. Without this clamp, a Move could drag the crop
+        // rect completely off the image, which is confusing.
         Handle.Move -> {
-            // Clamp the rect to the image bounds on canvas so we can't drag
-            // it past where the actual image pixels are.
-            // We don't have canvas size here; use the rect's own width/height.
-            val nx = rect.left + dx
-            val ny = rect.top + dy
-            Rect(nx, ny, nx + rect.width, ny + rect.height)
+            val maxLeft = imageBounds.right - rect.width
+            val maxTop = imageBounds.bottom - rect.height
+            val newLeft = (rect.left + dx).coerceIn(imageBounds.left, maxLeft)
+            val newTop = (rect.top + dy).coerceIn(imageBounds.top, maxTop)
+            Rect(newLeft, newTop, newLeft + rect.width, newTop + rect.height)
         }
+
+        // Corner handles: move two edges (one horizontal + one vertical).
         Handle.TL -> {
-            val newLeft = (rect.left + dx).coerceAtMost(rect.right - minSize)
-            val newTop = (rect.top + dy).coerceAtMost(rect.bottom - minSize)
-            Rect(newLeft, newTop, rect.right, rect.bottom)
+            val nl = (rect.left + dx).coerceAtMost(rect.right - minSize)
+            val nt = (rect.top + dy).coerceAtMost(rect.bottom - minSize)
+            Rect(nl, nt, rect.right, rect.bottom)
         }
         Handle.TR -> {
-            val newTop = (rect.top + dy).coerceAtMost(rect.bottom - minSize)
-            val newRight = max(rect.left + minSize, rect.right + dx)
-            Rect(rect.left, newTop, newRight, rect.bottom)
-        }
-        Handle.BL -> {
-            val newLeft = (rect.left + dx).coerceAtMost(rect.right - minSize)
-            val newBottom = max(rect.top + minSize, rect.bottom + dy)
-            Rect(newLeft, rect.top, rect.right, newBottom)
+            val nt = (rect.top + dy).coerceAtMost(rect.bottom - minSize)
+            val nr = max(rect.left + minSize, rect.right + dx)
+            Rect(rect.left, nt, nr, rect.bottom)
         }
         Handle.BR -> {
-            val newRight = max(rect.left + minSize, rect.right + dx)
-            val newBottom = max(rect.top + minSize, rect.bottom + dy)
-            Rect(rect.left, rect.top, newRight, newBottom)
+            val nr = max(rect.left + minSize, rect.right + dx)
+            val nb = max(rect.top + minSize, rect.bottom + dy)
+            Rect(rect.left, rect.top, nr, nb)
+        }
+        Handle.BL -> {
+            val nl = (rect.left + dx).coerceAtMost(rect.right - minSize)
+            val nb = max(rect.top + minSize, rect.bottom + dy)
+            Rect(nl, rect.top, rect.right, nb)
+        }
+
+        // Edge handles: move one edge, keep the opposite edge fixed.
+        Handle.T -> {
+            val nt = (rect.top + dy).coerceAtMost(rect.bottom - minSize)
+            Rect(rect.left, nt, rect.right, rect.bottom)
+        }
+        Handle.B -> {
+            val nb = max(rect.top + minSize, rect.bottom + dy)
+            Rect(rect.left, rect.top, rect.right, nb)
+        }
+        Handle.L -> {
+            val nl = (rect.left + dx).coerceAtMost(rect.right - minSize)
+            Rect(nl, rect.top, rect.right, rect.bottom)
+        }
+        Handle.R -> {
+            val nr = max(rect.left + minSize, rect.right + dx)
+            Rect(rect.left, rect.top, nr, rect.bottom)
         }
     }
 }
