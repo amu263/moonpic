@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Crescent moon + camera-shutter-inspired ring. -->
+    <path
+        android:fillColor="#FFE0B3FF"
+        android:pathData="M70,54m-22,0a22,22 0,1 1,44 0a22,22 0,1 1,-44 0z" />
+    <path
+        android:fillColor="#FF1A1B26"
+        android:pathData="M76,42a22,22 0,0 0,-26 26a22,22 0,1 0,26 -26z" />
+    <path
+        android:fillColor="#FFE0B3FF"
+        android:pathData="M70,54m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0z" />
+</vector>
