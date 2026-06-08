@@ -72,7 +72,11 @@ private const val MIN_CROP_IMG_PX = 16f
  */
 private const val DIM_FADE_PX = 40f
 
-private const val MIN_SCALE = 0.5f
+// 1.0f = natural fit-to-canvas. We deliberately don't allow the user to
+// pinch out below this — going smaller leaves the image floating in the
+// middle of the canvas with black around it, which feels broken in a crop
+// editor (you're already seeing the whole image at fit).
+private const val MIN_SCALE = 1.0f
 private const val MAX_SCALE = 5f
 
 /**
@@ -81,6 +85,9 @@ private const val MAX_SCALE = 5f
  * 1. **Crop UI** (8 handles + Move). Single-finger drag on a handle
  *    resizes the crop; single-finger drag inside the rect moves it.
  * 2. **Image viewport**. Two-finger pinch zooms; two-finger pan translates.
+ *    Zoom is clamped to `[1.0, 5.0]` — going below the natural fit-to-
+ *    canvas (1.0) would leave the image floating in the middle of the
+ *    canvas with black around it, which is jarring in a crop editor.
  *
  * Both gesture modes live in a single `awaitPointerEventScope` loop, so
  * switching between 1-finger and 2-finger is atomic (no event is dropped
@@ -88,6 +95,13 @@ private const val MAX_SCALE = 5f
  * committed to the parent only in `onDragEnd` to avoid recomposition
  * jitter; viewport changes are committed on every frame because they
  * don't suffer from the same roundtrip issue.
+ *
+ * Tap/double-tap lives in a separate `pointerInput` (`detectTapGestures`)
+ * registered above this one in the modifier chain. The two coexist
+ * because we only `consume()` events here once the user has actually
+ * moved beyond touch slop — until then the gesture is still a candidate
+ * tap and the tap detector needs to see it (otherwise double-tap to
+ * reset the viewport silently breaks).
  */
 @Composable
 fun CropOverlay(
@@ -133,10 +147,24 @@ fun CropOverlay(
                 )
             }
             .pointerInput(fit, imageBounds) {
+                // Per-event touch slop, used to decide when a finger-down
+                // has become a real drag. Until we exceed it we leave the
+                // events unconsumed so the detectTapGestures pointerInput
+                // (registered above) can still recognise taps — that gate
+                // is what makes double-tap-to-reset work.
+                val touchSlop = viewConfiguration.touchSlop
                 awaitPointerEventScope {
                     var lastPos: Offset? = null
                     var lastCentroid: Offset? = null
                     var lastDistance: Float? = null
+                    var downPos: Offset? = null
+                    var dragCommitted = false
+                    // Tracks whether the previous event in this gesture had
+                    // 2+ fingers. When a pinch ends and the user lifts one
+                    // finger, the remaining finger's quick release should
+                    // NOT be misread as a tap — it is the tail end of a
+                    // multi-touch gesture.
+                    var wasMultiTouch = false
 
                     while (true) {
                         val event = awaitPointerEvent()
@@ -153,10 +181,14 @@ fun CropOverlay(
                             lastPos = null
                             lastCentroid = null
                             lastDistance = null
+                            downPos = null
+                            dragCommitted = false
+                            wasMultiTouch = false
                             active = Handle.None
                         } else if (pressed.size >= 2) {
                             // Two-finger viewport gesture: centroid gives
-                            // pan delta, distance ratio gives zoom.
+                            // pan delta, distance ratio gives zoom. Always
+                            // consume — two fingers is unambiguously not a tap.
                             val centroid = (pressed[0].position + pressed[1].position) / 2f
                             val distance = (pressed[0].position - pressed[1].position).getDistance()
                             if (lastCentroid != null && lastDistance != null &&
@@ -176,30 +208,53 @@ fun CropOverlay(
                             lastDistance = distance
                             // Switch out of any single-finger crop state.
                             lastPos = null
+                            downPos = null
+                            dragCommitted = true
+                            wasMultiTouch = true
                             active = Handle.None
+                            for (change in event.changes) {
+                                if (change.pressed) change.consume()
+                            }
                         } else {
                             // Single-finger: crop handle.
                             val p = pressed[0]
                             if (lastPos == null) {
                                 active = pickHandle(p.position, rect)
                                 lastPos = p.position
+                                downPos = p.position
+                                // If we're entering single-finger from a
+                                // pinch (one finger just lifted), claim the
+                                // remaining touch immediately — otherwise
+                                // the quick release that often follows a
+                                // pinch-lift would look like a tap.
+                                dragCommitted = wasMultiTouch
                             } else {
                                 val dx = p.position.x - lastPos!!.x
                                 val dy = p.position.y - lastPos!!.y
                                 lastPos = p.position
-                                if (active != Handle.None) {
+                                if (downPos != null &&
+                                    (p.position - downPos!!).getDistance() > touchSlop
+                                ) {
+                                    dragCommitted = true
+                                }
+                                if (active != Handle.None && (dx != 0f || dy != 0f)) {
                                     rect = applyDrag(rect, active, dx, dy, fit, imageBounds)
+                                }
+                                // Only consume once the user has actually
+                                // moved beyond touch slop. Before that the
+                                // gesture is still a candidate tap and
+                                // detectTapGestures (registered above in the
+                                // modifier chain) needs to see it for the
+                                // double-tap reset to fire.
+                                if (dragCommitted) {
+                                    for (change in event.changes) {
+                                        if (change.pressed) change.consume()
+                                    }
                                 }
                             }
                             // Switch out of any two-finger viewport state.
                             lastCentroid = null
                             lastDistance = null
-                        }
-
-                        // Consume so the events don't leak to siblings
-                        // (in case we ever add a sibling gesture detector).
-                        for (change in event.changes) {
-                            if (change.pressed) change.consume()
                         }
                     }
                 }

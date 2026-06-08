@@ -95,8 +95,14 @@ class EditorViewModel @Inject constructor(
     }
 
     fun setCrop(rect: CropRect?) {
+        // The crop is a *selection overlay* only — it is applied to the
+        // source bitmap at save time, not to the live preview. Mutating
+        // previewBitmap on every crop change used to shrink the displayed
+        // image to the cropped region, so once the user pinched to zoom
+        // out they saw the cropped bitmap floating in the canvas with
+        // black space around it. We deliberately do not regenerate the
+        // preview here.
         _state.update { it.copy(crop = rect) }
-        applyPreview()
     }
 
     fun setMaxEdge(edge: Int) {
@@ -105,15 +111,19 @@ class EditorViewModel @Inject constructor(
     }
 
     private fun applyPreview() {
+        // Rebuild only the resize step (for perf); the crop selection is
+        // applied at save() time. Keeping the displayed bitmap equal to
+        // the source means the crop overlay's image-coordinate math stays
+        // valid while the user adjusts the selection.
         val src = _state.value.sourceBitmap ?: return
-        val crop = _state.value.crop
         val maxEdge = _state.value.maxEdge
         viewModelScope.launch {
             _state.update { it.copy(isWorking = true) }
             val preview = withContext(Dispatchers.IO) {
                 var bmp = src
-                if (crop != null) bmp = bmp.applyCrop(crop)
-                if (bmp.width > maxEdge || bmp.height > maxEdge) bmp = bmp.applyResize(maxEdge = maxEdge)
+                if (bmp.width > maxEdge || bmp.height > maxEdge) {
+                    bmp = bmp.applyResize(maxEdge = maxEdge)
+                }
                 bmp
             }
             _state.update { it.copy(previewBitmap = preview, isWorking = false) }

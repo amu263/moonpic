@@ -189,6 +189,14 @@ private fun CanvasArea(
                 )
             }
         } else {
+            // The editor canvas always renders the full source (possibly
+            // resized for perf). The crop selection is purely an overlay;
+            // it is only applied to the bitmap at save() time. This is
+            // what keeps pinch-zoom behaving sanely while the user is
+            // still adjusting the crop — a previous version baked the
+            // crop into previewBitmap on every drag end, which shrunk the
+            // displayed image and exposed black space around it whenever
+            // the user tried to zoom out.
             val display = state.previewBitmap ?: bmp
             Image(
                 bitmap = display.asImageBitmap(),
