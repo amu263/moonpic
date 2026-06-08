@@ -48,6 +48,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntSize
@@ -55,6 +56,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.moonpic.feature.editor.transforms.CropRect
+import dev.moonpic.feature.editor.transforms.ImageTransform
 import dev.moonpic.feature.editor.transforms.RotationDeg
 
 /**
@@ -138,6 +140,10 @@ private fun CanvasArea(
 ) {
     val bmp = state.sourceBitmap
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
+    // Image viewport (scale + offset). Independent of the crop: the user
+    // pinch-zooms to inspect detail without affecting the crop selection.
+    // Resets when a new image is picked (remember key = bmp).
+    var imageTransform by remember(bmp) { mutableStateOf(ImageTransform.Identity) }
 
     Box(
         modifier = Modifier
@@ -173,7 +179,14 @@ private fun CanvasArea(
             Image(
                 bitmap = display.asImageBitmap(),
                 contentDescription = "Editing preview",
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        scaleX = imageTransform.scale
+                        scaleY = imageTransform.scale
+                        translationX = imageTransform.offsetX
+                        translationY = imageTransform.offsetY
+                    },
                 contentScale = androidx.compose.ui.layout.ContentScale.Fit,
             )
             val canvasSizeF = androidx.compose.ui.geometry.Size(
@@ -185,7 +198,9 @@ private fun CanvasArea(
                     imageSize = IntSize(display.width, display.height),
                     canvasSize = canvasSizeF,
                     crop = state.crop,
+                    imageTransform = imageTransform,
                     onCropChange = onCropChange,
+                    onImageTransformChange = { imageTransform = it },
                 )
             }
         }

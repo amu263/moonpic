@@ -1,7 +1,6 @@
 package dev.moonpic.feature.editor
 
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -12,12 +11,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.IntSize
 import dev.moonpic.feature.editor.transforms.CropRect
+import dev.moonpic.feature.editor.transforms.ImageTransform
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -25,55 +28,69 @@ import kotlin.math.min
  * 8 directional resize handles + Move + None.
  *
  * The hit-testing is built so the corner boxes and the edge strips together
- * cover an "L"-shaped region around the entire rect. Corners are 200x200
- * squares straddling the corner pixel (so the user can grab the corner
- * from *inside* the rect as well as from outside), edges are 120px-wide
- * strips straddling the edge but clamped to not overlap the corner
- * boxes, and the deep interior is reserved for Move. Outside everything
- * is None so stray touches on the dimmed area don't grab anything.
+ * cover an "L"-shaped region around the entire rect:
+ *  - Corners are 200×200 boxes straddling the corner pixel (user can grab
+ *    from inside OR outside the rect).
+ *  - Edges are 160px-wide strips straddling the edge, clamped to not
+ *    overlap with the corner boxes.
+ *  - The deep interior is Move.
+ *  - Outside everything is None.
  */
 private enum class Handle { TL, T, TR, R, BR, B, BL, L, Move, None }
 
 private val MoonViolet = Color(0xFF7C4DFF)
+private val DimColor = Color.Black.copy(alpha = 0.55f)
 
-/**
- * Visible handle radius (px). On a 3x device this is ~6dp — small enough
- * not to cover the image, large enough to see clearly.
- */
+/** Visible handle radius (px). On 3x device ≈ 6dp — visible but unobtrusive. */
 private const val HANDLE_RADIUS_PX = 18f
 private const val HANDLE_DOT_PX = 9f
 
-/**
- * Half-size of a corner hit box. 100f → 200x200 box centred on the corner
- * pixel. On a 3x device this is ~66dp — well above the recommended 48dp
- * touch target size.
- */
+/** Half-size of a corner hit box. 100f → 200×200 box. On 3x ≈ 66dp. */
 private const val CORNER_HIT_HALF = 100f
 
 /**
- * Half-width of an edge hit strip. 60f → 120px strip straddling the edge
- * (~40dp on 3x). Excludes the corner zones.
+ * Half-width of an edge hit strip. 80f → 160px strip straddling the edge.
+ * On 3x ≈ 53dp. Big enough that finger touches on (or near) the visible
+ * border reliably land on the edge, not on the interior Move zone.
  */
-private const val EDGE_HIT_HALF = 60f
+private const val EDGE_HIT_HALF = 80f
 
 /** Minimum crop size in image-pixels, prevents collapse. */
 private const val MIN_CROP_IMG_PX = 16f
 
 /**
- * Crop overlay.
+ * Width of the dim-fade transition zone (px). Within this distance from
+ * the rect edge the dim alpha ramps from 0 (at the edge) to 0.55. Beyond
+ * this distance the dim stays at 0.55. Gives the crop a soft, photo-editor
+ * "lens" feel rather than a hard punched-out look.
+ */
+private const val DIM_FADE_PX = 40f
+
+private const val MIN_SCALE = 0.5f
+private const val MAX_SCALE = 5f
+
+/**
+ * Crop overlay with two responsibilities:
  *
- * Critical design point: during a drag, we update the **local** `rect`
- * only. The parent state is updated *only* in `onDragEnd` (via
- * `onCropChange`). Updating the parent on every drag event would force
- * recomposition and reset `rect` via the `remember(crop, fit)` block,
- * which is what caused the visible stuttering in v0.1.2.
+ * 1. **Crop UI** (8 handles + Move). Single-finger drag on a handle
+ *    resizes the crop; single-finger drag inside the rect moves it.
+ * 2. **Image viewport**. Two-finger pinch zooms; two-finger pan translates.
+ *
+ * Both gesture modes live in a single `awaitPointerEventScope` loop, so
+ * switching between 1-finger and 2-finger is atomic (no event is dropped
+ * during the transition). Per the v0.1.3 fix, crop changes are
+ * committed to the parent only in `onDragEnd` to avoid recomposition
+ * jitter; viewport changes are committed on every frame because they
+ * don't suffer from the same roundtrip issue.
  */
 @Composable
 fun CropOverlay(
     imageSize: IntSize,
     canvasSize: Size,
     crop: CropRect?,
+    imageTransform: ImageTransform,
     onCropChange: (CropRect) -> Unit,
+    onImageTransformChange: (ImageTransform) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     if (imageSize.width <= 0 || imageSize.height <= 0) return
@@ -81,7 +98,7 @@ fun CropOverlay(
     val fit = remember(imageSize, canvasSize) { fitRect(imageSize, canvasSize) }
     val imageBounds = remember(fit, imageSize) { imageBoundsOnCanvas(fit, imageSize) }
 
-    var rect by remember(crop, fit) {
+    var rect by remember(fit) {
         mutableStateOf<Rect>(
             crop?.let { mapImageToCanvas(it, fit) }
                 ?: mapImageToCanvas(
@@ -90,139 +107,232 @@ fun CropOverlay(
                 ),
         )
     }
+    var localTransform by remember { mutableStateOf(imageTransform) }
     var active by remember { mutableStateOf(Handle.None) }
-    var lastPos by remember { mutableStateOf(Offset.Zero) }
 
     Canvas(
         modifier = modifier
             .fillMaxSize()
             .pointerInput(fit, imageBounds) {
-                detectDragGestures(
-                    onDragStart = { off ->
-                        active = pickHandle(off, rect)
-                        lastPos = off
-                    },
-                    onDragEnd = {
-                        // Sync local → parent only at drag end so we don't
-                        // thrash recomposition during the drag.
-                        if (active != Handle.None) {
-                            onCropChange(mapCanvasToImage(rect, fit))
+                awaitPointerEventScope {
+                    var lastPos: Offset? = null
+                    var lastCentroid: Offset? = null
+                    var lastDistance: Float? = null
+
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val pressed = event.changes.filter { it.pressed }
+
+                        if (pressed.isEmpty()) {
+                            // Drag end: commit any pending change.
+                            if (active != Handle.None) {
+                                onCropChange(mapCanvasToImage(rect, fit))
+                            }
+                            if (lastCentroid != null) {
+                                onImageTransformChange(localTransform)
+                            }
+                            lastPos = null
+                            lastCentroid = null
+                            lastDistance = null
+                            active = Handle.None
+                        } else if (pressed.size >= 2) {
+                            // Two-finger viewport gesture: centroid gives
+                            // pan delta, distance ratio gives zoom.
+                            val centroid = (pressed[0].position + pressed[1].position) / 2f
+                            val distance = (pressed[0].position - pressed[1].position).getDistance()
+                            if (lastCentroid != null && lastDistance != null &&
+                                lastDistance!! > 0.1f
+                            ) {
+                                val panDelta = centroid - lastCentroid!!
+                                val zoom = distance / lastDistance!!
+                                localTransform = localTransform.copy(
+                                    scale = (localTransform.scale * zoom)
+                                        .coerceIn(MIN_SCALE, MAX_SCALE),
+                                    offsetX = localTransform.offsetX + panDelta.x,
+                                    offsetY = localTransform.offsetY + panDelta.y,
+                                )
+                                onImageTransformChange(localTransform)
+                            }
+                            lastCentroid = centroid
+                            lastDistance = distance
+                            // Switch out of any single-finger crop state.
+                            lastPos = null
+                            active = Handle.None
+                        } else {
+                            // Single-finger: crop handle.
+                            val p = pressed[0]
+                            if (lastPos == null) {
+                                active = pickHandle(p.position, rect)
+                                lastPos = p.position
+                            } else {
+                                val dx = p.position.x - lastPos!!.x
+                                val dy = p.position.y - lastPos!!.y
+                                lastPos = p.position
+                                if (active != Handle.None) {
+                                    rect = applyDrag(rect, active, dx, dy, fit, imageBounds)
+                                }
+                            }
+                            // Switch out of any two-finger viewport state.
+                            lastCentroid = null
+                            lastDistance = null
                         }
-                        active = Handle.None
-                    },
-                    onDragCancel = { active = Handle.None },
-                ) { change, _ ->
-                    if (active == Handle.None) return@detectDragGestures
-                    val dx = change.position.x - lastPos.x
-                    val dy = change.position.y - lastPos.y
-                    lastPos = change.position
-                    rect = applyDrag(rect, active, dx, dy, fit, imageBounds)
-                    // NOTE: no onCropChange here — that's the whole point.
+
+                        // Consume so the events don't leak to siblings
+                        // (in case we ever add a sibling gesture detector).
+                        for (change in event.changes) {
+                            if (change.pressed) change.consume()
+                        }
+                    }
                 }
             },
     ) {
-        val dim = Color.Black.copy(alpha = 0.55f)
+        drawDimAndCrop(rect, active)
+    }
+}
 
-        // Four strips: top / bottom / left / right. Together they cover
-        // exactly the area outside the crop rect, so the inside stays
-        // fully visible.
-        if (rect.top > 0f) {
-            drawRect(
-                color = dim,
-                topLeft = Offset(0f, 0f),
-                size = Size(size.width, rect.top),
-            )
-        }
-        if (rect.bottom < size.height) {
-            drawRect(
-                color = dim,
-                topLeft = Offset(0f, rect.bottom),
-                size = Size(size.width, size.height - rect.bottom),
-            )
-        }
-        if (rect.left > 0f) {
-            drawRect(
-                color = dim,
-                topLeft = Offset(0f, rect.top),
-                size = Size(rect.left, rect.height),
-            )
-        }
-        if (rect.right < size.width) {
-            drawRect(
-                color = dim,
-                topLeft = Offset(rect.right, rect.top),
-                size = Size(size.width - rect.right, rect.height),
-            )
-        }
+private fun DrawScope.drawDimAndCrop(rect: Rect, active: Handle) {
+    // Gradient dim — top / bottom / left / right strips. Each strip fades
+    // from Color.Transparent at the rect edge to DimColor over DIM_FADE_PX,
+    // then stays at DimColor out to the canvas edge. This makes the crop
+    // feel like a "soft lens" rather than a hard punched-out hole.
 
-        // Rule-of-thirds grid — clipped to the crop rect so the lines
-        // never spill into the dimmed area.
-        clipRect(left = rect.left, top = rect.top, right = rect.right, bottom = rect.bottom) {
-            val third = rect.width / 3f
-            val thirdH = rect.height / 3f
-            for (i in 1..2) {
-                drawLine(
-                    Color.White.copy(alpha = 0.45f),
-                    Offset(rect.left + third * i, rect.top),
-                    Offset(rect.left + third * i, rect.bottom),
-                    strokeWidth = 1f,
-                )
-                drawLine(
-                    Color.White.copy(alpha = 0.45f),
-                    Offset(rect.left, rect.top + thirdH * i),
-                    Offset(rect.right, rect.top + thirdH * i),
-                    strokeWidth = 1f,
-                )
-            }
-        }
-
-        // Bright border around the crop rect.
+    if (rect.top > 0f) {
         drawRect(
-            color = Color.White,
-            topLeft = rect.topLeft,
-            size = rect.size,
-            style = Stroke(width = 3f),
+            brush = verticalDimBrush(rect.top, 0f),
+            topLeft = Offset(0f, 0f),
+            size = Size(size.width, rect.top),
         )
+    }
+    if (rect.bottom < size.height) {
+        drawRect(
+            brush = verticalDimBrush(rect.bottom, size.height),
+            topLeft = Offset(0f, rect.bottom),
+            size = Size(size.width, size.height - rect.bottom),
+        )
+    }
+    if (rect.left > 0f) {
+        drawRect(
+            brush = horizontalDimBrush(rect.left, 0f),
+            topLeft = Offset(0f, rect.top),
+            size = Size(rect.left, rect.height),
+        )
+    }
+    if (rect.right < size.width) {
+        drawRect(
+            brush = horizontalDimBrush(rect.right, size.width),
+            topLeft = Offset(rect.right, rect.top),
+            size = Size(size.width - rect.right, rect.height),
+        )
+    }
 
-        // Corner handles. The active corner is drawn larger as visual
-        // feedback that the touch was registered.
-        for (h in listOf(Handle.TL, Handle.TR, Handle.BL, Handle.BR)) {
-            val center = when (h) {
-                Handle.TL -> rect.topLeft
-                Handle.TR -> rect.topRight
-                Handle.BL -> rect.bottomLeft
-                Handle.BR -> rect.bottomRight
-                else -> Offset.Zero
-            }
-            val isActive = active == h
-            drawCircle(
-                Color.White.copy(alpha = if (isActive) 1f else 0.85f),
-                radius = if (isActive) HANDLE_RADIUS_PX + 4f else HANDLE_RADIUS_PX,
-                center = center,
+    // Rule-of-thirds grid — clipped to the crop rect.
+    clipRect(left = rect.left, top = rect.top, right = rect.right, bottom = rect.bottom) {
+        val third = rect.width / 3f
+        val thirdH = rect.height / 3f
+        for (i in 1..2) {
+            drawLine(
+                Color.White.copy(alpha = 0.45f),
+                Offset(rect.left + third * i, rect.top),
+                Offset(rect.left + third * i, rect.bottom),
+                strokeWidth = 1f,
             )
-            drawCircle(
-                MoonViolet.copy(alpha = if (isActive) 1f else 0.9f),
-                radius = if (isActive) HANDLE_DOT_PX + 2f else HANDLE_DOT_PX,
-                center = center,
-            )
-        }
-
-        // Mid-edge pips. Active edge is drawn larger/violet as feedback.
-        val anyEdgeActive = active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)
-        for ((edge, center) in listOf(
-            Handle.T to Offset((rect.left + rect.right) / 2f, rect.top),
-            Handle.B to Offset((rect.left + rect.right) / 2f, rect.bottom),
-            Handle.L to Offset(rect.left, (rect.top + rect.bottom) / 2f),
-            Handle.R to Offset(rect.right, (rect.top + rect.bottom) / 2f),
-        )) {
-            val isActive = active == edge
-            drawCircle(
-                if (isActive) MoonViolet else Color.White.copy(alpha = 0.85f),
-                radius = if (isActive || anyEdgeActive) 11f else 7f,
-                center = center,
+            drawLine(
+                Color.White.copy(alpha = 0.45f),
+                Offset(rect.left, rect.top + thirdH * i),
+                Offset(rect.right, rect.top + thirdH * i),
+                strokeWidth = 1f,
             )
         }
     }
+
+    // Bright border around the crop rect.
+    drawRect(
+        color = Color.White,
+        topLeft = rect.topLeft,
+        size = rect.size,
+        style = Stroke(width = 3f),
+    )
+
+    // Corner handles. The active corner is drawn larger / fully opaque
+    // as touch feedback.
+    for (h in listOf(Handle.TL, Handle.TR, Handle.BL, Handle.BR)) {
+        val center = when (h) {
+            Handle.TL -> rect.topLeft
+            Handle.TR -> rect.topRight
+            Handle.BL -> rect.bottomLeft
+            Handle.BR -> rect.bottomRight
+            else -> Offset.Zero
+        }
+        val isActive = active == h
+        drawCircle(
+            Color.White.copy(alpha = if (isActive) 1f else 0.85f),
+            radius = if (isActive) HANDLE_RADIUS_PX + 4f else HANDLE_RADIUS_PX,
+            center = center,
+        )
+        drawCircle(
+            MoonViolet.copy(alpha = if (isActive) 1f else 0.9f),
+            radius = if (isActive) HANDLE_DOT_PX + 2f else HANDLE_DOT_PX,
+            center = center,
+        )
+    }
+
+    // Mid-edge pips. Active edge is drawn larger / violet as feedback.
+    val anyEdgeActive = active in listOf(Handle.T, Handle.B, Handle.L, Handle.R)
+    for ((edge, center) in listOf(
+        Handle.T to Offset((rect.left + rect.right) / 2f, rect.top),
+        Handle.B to Offset((rect.left + rect.right) / 2f, rect.bottom),
+        Handle.L to Offset(rect.left, (rect.top + rect.bottom) / 2f),
+        Handle.R to Offset(rect.right, (rect.top + rect.bottom) / 2f),
+    )) {
+        val isActive = active == edge
+        drawCircle(
+            if (isActive) MoonViolet else Color.White.copy(alpha = 0.85f),
+            radius = if (isActive || anyEdgeActive) 11f else 7f,
+            center = center,
+        )
+    }
+}
+
+private fun verticalDimBrush(edgeY: Float, endY: Float): Brush {
+    val h = abs(endY - edgeY)
+    val stops: Array<Pair<Float, Color>> = if (h > DIM_FADE_PX) {
+        arrayOf(
+            0f to Color.Transparent,            // at edgeY
+            (DIM_FADE_PX / h) to DimColor,      // at edgeY ± DIM_FADE_PX
+            1f to DimColor,                     // at endY
+        )
+    } else {
+        arrayOf(
+            0f to Color.Transparent,
+            1f to DimColor,
+        )
+    }
+    return Brush.verticalGradient(
+        colorStops = stops,
+        startY = edgeY,
+        endY = endY,
+    )
+}
+
+private fun horizontalDimBrush(edgeX: Float, endX: Float): Brush {
+    val w = abs(endX - edgeX)
+    val stops: Array<Pair<Float, Color>> = if (w > DIM_FADE_PX) {
+        arrayOf(
+            0f to Color.Transparent,
+            (DIM_FADE_PX / w) to DimColor,
+            1f to DimColor,
+        )
+    } else {
+        arrayOf(
+            0f to Color.Transparent,
+            1f to DimColor,
+        )
+    }
+    return Brush.horizontalGradient(
+        colorStops = stops,
+        startX = edgeX,
+        endX = endX,
+    )
 }
 
 private data class Fit(val scale: Float, val dx: Float, val dy: Float)
@@ -263,12 +373,12 @@ private fun imageBoundsOnCanvas(f: Fit, image: IntSize): Rect {
  * Hit-testing for the 8 directional handles + Move.
  *
  * Corners are 200×200 boxes straddling the corner pixel. Edge strips are
- * 120px wide, also straddling the edge, but clamped to NOT overlap the
- * corner boxes. The deep interior of the rect (after subtracting the
- * edge strips) is Move. Outside everything is None.
+ * 160px wide, also straddling the edge, but clamped to NOT overlap the
+ * corner boxes (the corner check has higher priority, so corners always
+ * win in the overlap). The deep interior of the rect is Move. Outside
+ * everything is None.
  */
 private fun pickHandle(off: Offset, rect: Rect): Handle {
-    // Corners (square, centred on the corner pixel).
     if (off.x in (rect.left - CORNER_HIT_HALF)..(rect.left + CORNER_HIT_HALF) &&
         off.y in (rect.top - CORNER_HIT_HALF)..(rect.top + CORNER_HIT_HALF)
     ) return Handle.TL
@@ -282,7 +392,6 @@ private fun pickHandle(off: Offset, rect: Rect): Handle {
         off.y in (rect.bottom - CORNER_HIT_HALF)..(rect.bottom + CORNER_HIT_HALF)
     ) return Handle.BR
 
-    // Edges (not overlapping the corner boxes).
     if (off.y in (rect.top - EDGE_HIT_HALF)..(rect.top + EDGE_HIT_HALF) &&
         off.x in (rect.left + CORNER_HIT_HALF)..(rect.right - CORNER_HIT_HALF)
     ) return Handle.T
@@ -296,7 +405,6 @@ private fun pickHandle(off: Offset, rect: Rect): Handle {
         off.y in (rect.top + CORNER_HIT_HALF)..(rect.bottom - CORNER_HIT_HALF)
     ) return Handle.R
 
-    // Interior is Move.
     if (rect.contains(off)) return Handle.Move
 
     return Handle.None
