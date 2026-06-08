@@ -1,6 +1,7 @@
 package dev.moonpic.feature.editor
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -41,19 +42,24 @@ private enum class Handle { TL, T, TR, R, BR, B, BL, L, Move, None }
 private val MoonViolet = Color(0xFF7C4DFF)
 private val DimColor = Color.Black.copy(alpha = 0.55f)
 
-/** Visible handle radius (px). On 3x device ≈ 6dp — visible but unobtrusive. */
-private const val HANDLE_RADIUS_PX = 18f
-private const val HANDLE_DOT_PX = 9f
-
-/** Half-size of a corner hit box. 100f → 200×200 box. On 3x ≈ 66dp. */
-private const val CORNER_HIT_HALF = 100f
+/** Visible handle radius (px). On 3x device ≈ 8dp — clearly visible. */
+private const val HANDLE_RADIUS_PX = 24f
+private const val HANDLE_DOT_PX = 12f
 
 /**
- * Half-width of an edge hit strip. 80f → 160px strip straddling the edge.
- * On 3x ≈ 53dp. Big enough that finger touches on (or near) the visible
- * border reliably land on the edge, not on the interior Move zone.
+ * Half-size of a corner hit box. 140f → 280×280 box. On 3x ≈ 47dp —
+ * well above the recommended 48dp touch target. Big enough that finger
+ * touches anywhere near the visible corner reliably land on the corner,
+ * including from inside the rect.
  */
-private const val EDGE_HIT_HALF = 80f
+private const val CORNER_HIT_HALF = 140f
+
+/**
+ * Half-width of an edge hit strip. 100f → 200px strip straddling the edge.
+ * On 3x ≈ 33dp. Generous enough that finger touches on the visible
+ * border (or within ~33dp of it) reliably land on the edge.
+ */
+private const val EDGE_HIT_HALF = 100f
 
 /** Minimum crop size in image-pixels, prevents collapse. */
 private const val MIN_CROP_IMG_PX = 16f
@@ -113,6 +119,19 @@ fun CropOverlay(
     Canvas(
         modifier = modifier
             .fillMaxSize()
+            .pointerInput(Unit) {
+                // Double-tap to reset the image viewport. Registered
+                // BEFORE the main gesture handler so it sees the down
+                // event first; if it fires onDoubleTap it consumes the
+                // events, otherwise the main handler still processes
+                // the touch as crop. This is a no-op when the viewport
+                // is already at Identity.
+                detectTapGestures(
+                    onDoubleTap = {
+                        onImageTransformChange(ImageTransform.Identity)
+                    },
+                )
+            }
             .pointerInput(fit, imageBounds) {
                 awaitPointerEventScope {
                     var lastPos: Offset? = null

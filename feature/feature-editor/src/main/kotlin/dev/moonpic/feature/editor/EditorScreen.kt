@@ -18,10 +18,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.AspectRatio
 import androidx.compose.material.icons.outlined.Crop
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Save
 import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material.icons.outlined.ZoomOutMap
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -85,6 +87,16 @@ fun editorScreen(
         uri?.let { vm.loadSource(it.toString()) }
     }
 
+    // Image viewport (scale + offset). Independent of the crop: pinch-zoom
+    // to inspect detail without affecting the crop selection. Resets when a
+    // new image is loaded (remember key = state.sourceBitmap). The crop
+    // frame is a separate piece of state owned by the ViewModel and is
+    // *not* affected by the reset — the user can pinch-zoom, see detail,
+    // and reset view without losing their crop selection.
+    var imageTransform by remember(state.sourceBitmap) {
+        mutableStateOf(ImageTransform.Identity)
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -117,16 +129,20 @@ fun editorScreen(
         ) {
             CanvasArea(
                 state = state,
+                imageTransform = imageTransform,
                 onCropChange = vm::setCrop,
+                onImageTransformChange = { imageTransform = it },
                 onPick = {
                     pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                 },
             )
             Toolbar(
                 state = state,
+                imageTransform = imageTransform,
                 onRotateLeft = { vm.rotate(RotationDeg.D270) },
                 onRotateRight = { vm.rotate(RotationDeg.D90) },
                 onMaxEdgeChange = vm::setMaxEdge,
+                onResetView = { imageTransform = ImageTransform.Identity },
             )
         }
     }
@@ -135,15 +151,13 @@ fun editorScreen(
 @Composable
 private fun CanvasArea(
     state: EditorState,
+    imageTransform: ImageTransform,
     onCropChange: (CropRect) -> Unit,
+    onImageTransformChange: (ImageTransform) -> Unit,
     onPick: () -> Unit,
 ) {
     val bmp = state.sourceBitmap
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
-    // Image viewport (scale + offset). Independent of the crop: the user
-    // pinch-zooms to inspect detail without affecting the crop selection.
-    // Resets when a new image is picked (remember key = bmp).
-    var imageTransform by remember(bmp) { mutableStateOf(ImageTransform.Identity) }
 
     Box(
         modifier = Modifier
@@ -200,7 +214,7 @@ private fun CanvasArea(
                     crop = state.crop,
                     imageTransform = imageTransform,
                     onCropChange = onCropChange,
-                    onImageTransformChange = { imageTransform = it },
+                    onImageTransformChange = onImageTransformChange,
                 )
             }
         }
@@ -216,10 +230,16 @@ private fun CanvasArea(
 @Composable
 private fun Toolbar(
     state: EditorState,
+    imageTransform: ImageTransform,
     onRotateLeft: () -> Unit,
     onRotateRight: () -> Unit,
     onMaxEdgeChange: (Int) -> Unit,
+    onResetView: () -> Unit,
 ) {
+    val isViewIdentity = imageTransform.scale == 1f &&
+        imageTransform.offsetX == 0f &&
+        imageTransform.offsetY == 0f
+
     Surface(
         color = MaterialTheme.colorScheme.surfaceVariant,
         shape = RoundedCornerShape(16.dp),
@@ -233,6 +253,7 @@ private fun Toolbar(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            // ─── Transform section ─────────────────────────────────────
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -245,19 +266,57 @@ private fun Toolbar(
                 AssistChip(onClick = onRotateRight, label = { Text("⟳ 90°") })
                 AssistChip(
                     onClick = {},
-                    label = { Text("Crop (drag the box)") },
+                    label = { Text("Crop") },
                     leadingIcon = { Icon(Icons.Outlined.Crop, null) },
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Outlined.Refresh, contentDescription = null)
-                Text("  Max edge: ${state.maxEdge}px", style = MaterialTheme.typography.bodyMedium)
+                Icon(Icons.Outlined.AspectRatio, contentDescription = null)
+                Text(
+                    "  Max edge: ${state.maxEdge}px",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
             }
             Slider(
                 value = state.maxEdge.toFloat(),
                 onValueChange = { onMaxEdgeChange(it.toInt()) },
                 valueRange = 512f..8192f,
                 steps = 14,
+            )
+
+            // ─── View section ───────────────────────────────────────────
+            // Reset the image viewport (scale + offset) back to fit-to-
+            // canvas. Does NOT touch the crop. The button is disabled when
+            // the viewport is already at the default fit, so the user can
+            // see at a glance that nothing needs resetting.
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(Icons.Outlined.ZoomOutMap, contentDescription = null)
+                Text("View", style = MaterialTheme.typography.titleMedium)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                AssistChip(
+                    onClick = onResetView,
+                    enabled = !isViewIdentity,
+                    label = {
+                        Text(
+                            when {
+                                isViewIdentity -> "Fit (already)"
+                                imageTransform.scale > 1.01f -> "Reset view (${"%.1f".format(imageTransform.scale)}×)"
+                                imageTransform.scale < 0.99f -> "Reset view (${"%.1f".format(imageTransform.scale)}×)"
+                                else -> "Reset view"
+                            },
+                        )
+                    },
+                    leadingIcon = { Icon(Icons.Outlined.Refresh, null) },
+                )
+            }
+            Text(
+                "Tip: double-tap the image to reset view",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
